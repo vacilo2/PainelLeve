@@ -61,21 +61,51 @@ static void IniWriteInt(const WCHAR *key, int v) {
 }
 static int IniReadInt(const WCHAR *key, int def) { return GetPrivateProfileIntW(L"geral", key, def, g_ini); }
 
+// Log de inicializacao (start.log ao lado do exe): ajuda a descobrir por que o app nao subiu no logon
+static void StartLog(const WCHAR *msg) {
+    WCHAR p[MAX_PATH]; wcscpy(p, g_exe); WCHAR *s = wcsrchr(p, L'\\'); if (!s) return; wcscpy(s + 1, L"start.log");
+    FILE *f = _wfopen(p, L"a, ccs=UTF-8"); if (!f) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    fwprintf(f, L"[%04d-%02d-%02d %02d:%02d:%02d] %s\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, msg);
+    fclose(f);
+}
+
+// "Iniciar com o Windows" = tarefa agendada no logon, com atraso de 15 s (a chave Run dispara cedo
+// demais, antes da barra de tarefas existir, e se mostrou pouco confiavel neste PC).
+static BOOL RunHidden(const WCHAR *cmdline, DWORD *exitCode) {
+    STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    WCHAR buf[2048]; wcsncpy(buf, cmdline, 2047); buf[2047] = 0;
+    if (!CreateProcessW(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return FALSE;
+    WaitForSingleObject(pi.hProcess, 15000); GetExitCodeProcess(pi.hProcess, exitCode);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread); return TRUE;
+}
 static BOOL StartupEnabled(void) {
-    HKEY k; WCHAR v[MAX_PATH]; DWORD n = sizeof v, t;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &k)) return FALSE;
-    LONG r = RegQueryValueExW(k, APP_NAME, NULL, &t, (BYTE *)v, &n);
-    RegCloseKey(k);
-    return r == ERROR_SUCCESS;
+    DWORD code = 1;
+    return RunHidden(L"schtasks.exe /Query /TN \"PainelLeve\"", &code) && code == 0;
 }
 static void SetStartup(BOOL on) {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &k)) return;
+    DWORD code;
     if (on) {
-        WCHAR v[MAX_PATH + 2]; _snwprintf(v, MAX_PATH + 2, L"\"%s\"", g_exe);
-        RegSetValueExW(k, APP_NAME, 0, REG_SZ, (BYTE *)v, (DWORD)((wcslen(v) + 1) * sizeof(WCHAR)));
-    } else RegDeleteValueW(k, APP_NAME);
-    RegCloseKey(k);
+        // cria/atualiza a tarefa via XML (unico jeito de ter atraso no logon sem a interface grafica)
+        WCHAR xmlPath[MAX_PATH]; GetTempPathW(MAX_PATH, xmlPath); wcscat(xmlPath, L"PainelLeve-task.xml");
+        FILE *f = _wfopen(xmlPath, L"w, ccs=UTF-16LE");
+        if (!f) return;
+        fwprintf(f,
+            L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"
+            L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
+            L"  <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>PT15S</Delay></LogonTrigger></Triggers>\n"
+            L"  <Principals><Principal id=\"u\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n"
+            L"  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+            L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+            L"    <StartWhenAvailable>true</StartWhenAvailable><Priority>7</Priority></Settings>\n"
+            L"  <Actions Context=\"u\"><Exec><Command>%s</Command></Exec></Actions>\n"
+            L"</Task>\n", g_exe);
+        fclose(f);
+        WCHAR cmd[MAX_PATH * 2]; _snwprintf(cmd, MAX_PATH * 2, L"schtasks.exe /Create /F /TN \"PainelLeve\" /XML \"%s\"", xmlPath);
+        RunHidden(cmd, &code); DeleteFileW(xmlPath);
+    } else RunHidden(L"schtasks.exe /Delete /F /TN \"PainelLeve\"", &code);
+    // remove a chave Run antiga, se existir (versoes anteriores)
+    HKEY k; if (!RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &k)) { RegDeleteValueW(k, APP_NAME); RegCloseKey(k); }
 }
 
 // ---------------------------------------------------------------- icone da bandeja (desenhado em tempo de execucao)
@@ -321,8 +351,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show) {
     (void)prev; (void)cmd; (void)show;
     g_hinst = hi;
+    GetModuleFileNameW(NULL, g_exe, MAX_PATH);
     HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\PainelLeve.Instancia");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;   // ja esta rodando
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { StartLog(L"ja estava rodando; saindo"); return 0; }
+    StartLog(L"iniciando");
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);           // Core Audio (mixer)
 
     // DPI por monitor (sem manifesto): carrega em tempo de execucao
@@ -333,7 +365,6 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show) {
     UINT (WINAPI *getDpi)(void) = (void *)GetProcAddress(u32, "GetDpiForSystem");
     if (getDpi) g_dpi = getDpi();
 
-    GetModuleFileNameW(NULL, g_exe, MAX_PATH);
     wcscpy(g_ini, g_exe); WCHAR *dot = wcsrchr(g_ini, L'\\'); wcscpy(dot + 1, L"config.ini");
     // DLL do Explorer: nome configuravel (tap_dll no config.ini) para permitir trocar de versao sem reiniciar o Explorer
     WCHAR tapName[MAX_PATH]; GetPrivateProfileStringW(L"geral", L"tap_dll", L"PainelLeveTap.dll", tapName, MAX_PATH, g_ini);
@@ -360,8 +391,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show) {
     ShowMeter(g_meterOn);
     UpdateTimer();
 
+    StartLog(L"pronto (icone na bandeja)");
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    StartLog(L"encerrando normalmente");
     DeleteObject(g_font); DestroyIcon(g_icon); CloseHandle(mtx);
     return 0;
 }
