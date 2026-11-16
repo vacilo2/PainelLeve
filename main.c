@@ -5,8 +5,10 @@
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -70,41 +72,29 @@ static void StartLog(const WCHAR *msg) {
     fclose(f);
 }
 
-// "Iniciar com o Windows" = tarefa agendada no logon, com atraso de 15 s (a chave Run dispara cedo
-// demais, antes da barra de tarefas existir, e se mostrou pouco confiavel neste PC).
-static BOOL RunHidden(const WCHAR *cmdline, DWORD *exitCode) {
-    STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    WCHAR buf[2048]; wcsncpy(buf, cmdline, 2047); buf[2047] = 0;
-    if (!CreateProcessW(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return FALSE;
-    WaitForSingleObject(pi.hProcess, 15000); GetExitCodeProcess(pi.hProcess, exitCode);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread); return TRUE;
+// "Iniciar com o Windows" = atalho na pasta Inicializar do usuario (o Explorer o dispara depois de
+// estar pronto; nao exige administrador, ao contrario de uma tarefa agendada de logon). A chave Run,
+// usada antes, nao iniciava o app neste PC.
+static void StartupLinkPath(WCHAR *out) {
+    SHGetFolderPathW(NULL, CSIDL_STARTUP, NULL, 0, out);
+    wcscat(out, L"\\PainelLeve.lnk");
 }
-static BOOL StartupEnabled(void) {
-    DWORD code = 1;
-    return RunHidden(L"schtasks.exe /Query /TN \"PainelLeve\"", &code) && code == 0;
-}
+static BOOL StartupEnabled(void) { WCHAR p[MAX_PATH]; StartupLinkPath(p); return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
 static void SetStartup(BOOL on) {
-    DWORD code;
-    if (on) {
-        // cria/atualiza a tarefa via XML (unico jeito de ter atraso no logon sem a interface grafica)
-        WCHAR xmlPath[MAX_PATH]; GetTempPathW(MAX_PATH, xmlPath); wcscat(xmlPath, L"PainelLeve-task.xml");
-        FILE *f = _wfopen(xmlPath, L"w, ccs=UTF-16LE");
-        if (!f) return;
-        fwprintf(f,
-            L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"
-            L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
-            L"  <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>PT15S</Delay></LogonTrigger></Triggers>\n"
-            L"  <Principals><Principal id=\"u\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n"
-            L"  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
-            L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
-            L"    <StartWhenAvailable>true</StartWhenAvailable><Priority>7</Priority></Settings>\n"
-            L"  <Actions Context=\"u\"><Exec><Command>%s</Command></Exec></Actions>\n"
-            L"</Task>\n", g_exe);
-        fclose(f);
-        WCHAR cmd[MAX_PATH * 2]; _snwprintf(cmd, MAX_PATH * 2, L"schtasks.exe /Create /F /TN \"PainelLeve\" /XML \"%s\"", xmlPath);
-        RunHidden(cmd, &code); DeleteFileW(xmlPath);
-    } else RunHidden(L"schtasks.exe /Delete /F /TN \"PainelLeve\"", &code);
-    // remove a chave Run antiga, se existir (versoes anteriores)
+    WCHAR p[MAX_PATH]; StartupLinkPath(p);
+    if (!on) { DeleteFileW(p); }
+    else {
+        IShellLinkW *sl = NULL;
+        if (SUCCEEDED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&sl))) {
+            IShellLinkW_SetPath(sl, g_exe);
+            WCHAR dir[MAX_PATH]; wcscpy(dir, g_exe); *wcsrchr(dir, L'\\') = 0; IShellLinkW_SetWorkingDirectory(sl, dir);
+            IShellLinkW_SetDescription(sl, L"Painel Leve");
+            IPersistFile *pf = NULL;
+            if (SUCCEEDED(IShellLinkW_QueryInterface(sl, &IID_IPersistFile, (void **)&pf))) { IPersistFile_Save(pf, p, TRUE); IPersistFile_Release(pf); }
+            IShellLinkW_Release(sl);
+        }
+    }
+    // remove a chave Run de versoes anteriores
     HKEY k; if (!RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &k)) { RegDeleteValueW(k, APP_NAME); RegCloseKey(k); }
 }
 
@@ -356,6 +346,9 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) { StartLog(L"ja estava rodando; saindo"); return 0; }
     StartLog(L"iniciando");
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);           // Core Audio (mixer)
+    // No logon o app pode subir antes da barra de tarefas existir: espera ate 60 s por ela
+    for (int i = 0; i < 120 && !FindWindowW(L"Shell_TrayWnd", NULL); i++) { if (i == 0) StartLog(L"barra de tarefas ainda nao existe; esperando"); Sleep(500); }
+    StartLog(FindWindowW(L"Shell_TrayWnd", NULL) ? L"barra de tarefas encontrada" : L"barra de tarefas nao apareceu em 60 s; seguindo assim mesmo");
 
     // DPI por monitor (sem manifesto): carrega em tempo de execucao
     HMODULE u32 = GetModuleHandleW(L"user32.dll");

@@ -25,21 +25,11 @@ Remove-Item $zip -ErrorAction SilentlyContinue
 # a DLL fica travada pelo Explorer enquanto a versao antiga estiver carregada; o app sabe lidar com isso
 # (PainelLeveTap.dll nova so entra em uso depois de um reinicio do Explorer ou do PC)
 
-# iniciar com o Windows: tarefa agendada no logon com 15 s de atraso (a chave Run dispara cedo demais)
+# iniciar com o Windows: atalho na pasta Inicializar do usuario (nao exige administrador)
 Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name PainelLeve -ErrorAction SilentlyContinue
-$xml = @"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>PT15S</Delay></LogonTrigger></Triggers>
-  <Principals><Principal id="u"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <StartWhenAvailable>true</StartWhenAvailable><Priority>7</Priority></Settings>
-  <Actions Context="u"><Exec><Command>$exe</Command></Exec></Actions>
-</Task>
-"@
-$xmlPath = Join-Path $env:TEMP 'PainelLeve-task.xml'; [IO.File]::WriteAllText($xmlPath, $xml, [Text.Encoding]::Unicode)
-schtasks.exe /Create /F /TN PainelLeve /XML $xmlPath | Out-Null; Remove-Item $xmlPath -ErrorAction SilentlyContinue
+$lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'PainelLeve.lnk'
+$sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+$sc.TargetPath = $exe; $sc.WorkingDirectory = $dir; $sc.Description = 'Painel Leve'; $sc.Save()
 Start-Process $exe
 Write-Host "Pronto! PainelLeve $($rel.tag_name) instalado em $dir e configurado para iniciar com o Windows." -ForegroundColor Green
 Write-Host "O icone (dois sliders) fica na bandeja, ao lado do relogio. Clique esquerdo = mixer, clique direito = menu."
