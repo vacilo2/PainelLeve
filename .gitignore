@@ -1,0 +1,9 @@
+# binarios gerados pelo build.cmd
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+# configuracao e logs locais
+config.ini
+tap.log

@@ -1,0 +1,4 @@
+LIBRARY PainelLeveTap
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
