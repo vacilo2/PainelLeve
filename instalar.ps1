@@ -3,8 +3,11 @@
 # Uso (PowerShell):  irm https://raw.githubusercontent.com/vacilo2/PainelLeve/main/instalar.ps1 | iex
 $ErrorActionPreference = 'Stop'
 $repo = 'vacilo2/PainelLeve'
-$dir  = Join-Path $env:LOCALAPPDATA 'PainelLeve'
+# Pasta padrao de apps por usuario. Importante: o Explorer carrega a DLL daqui, mas NAO de
+# %LOCALAPPDATA%\PainelLeve (sem erro nenhum) - nao mude para outra pasta sem testar.
+$dir  = Join-Path $env:LOCALAPPDATA 'Programs\PainelLeve'
 $exe  = Join-Path $dir 'PainelLeve.exe'
+$old  = Join-Path $env:LOCALAPPDATA 'PainelLeve'           # local das versoes 1.0.0-1.0.2
 
 Write-Host "PainelLeve: procurando a versao mais recente..." -ForegroundColor Cyan
 $rel = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest" -Headers @{ 'User-Agent' = 'PainelLeve-instalador' }
@@ -21,6 +24,7 @@ Get-Process PainelLeve -ErrorAction SilentlyContinue | Stop-Process -Force -Erro
 
 New-Item -ItemType Directory -Force $dir | Out-Null
 Expand-Archive $zip -DestinationPath $dir -Force
+if (Test-Path $old) { Remove-Item $old -Recurse -Force -ErrorAction SilentlyContinue }   # migra de versoes antigas
 Remove-Item $zip -ErrorAction SilentlyContinue
 # a DLL fica travada pelo Explorer enquanto a versao antiga estiver carregada; o app sabe lidar com isso
 # (PainelLeveTap.dll nova so entra em uso depois de um reinicio do Explorer ou do PC)

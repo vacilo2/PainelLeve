@@ -11,8 +11,9 @@ Abra o **PowerShell** (Win + X → Terminal) e cole:
 irm https://raw.githubusercontent.com/vacilo2/PainelLeve/main/instalar.ps1 | iex
 ```
 
-Isso baixa a versão mais recente, instala em `%LOCALAPPDATA%\PainelLeve`, configura para iniciar
-com o Windows e abre o app. Para **atualizar**, rode o mesmo comando de novo.
+Isso baixa a versão mais recente, instala em `%LOCALAPPDATA%\Programs\PainelLeve`, configura para
+iniciar com o Windows (atalho na pasta Inicializar) e abre o app. Para **atualizar**, rode o mesmo
+comando de novo.
 
 Requisito: Windows 11. (No Windows 10 o app abre, mas a barra não fica transparente.)
 
@@ -24,8 +25,8 @@ Requisito: Windows 11. (No Windows 10 o app abre, mas a barra não fica transpar
 
 ### Desinstalar
 
-Clique direito no ícone → **Sair**, desmarque **Iniciar com o Windows** antes se estiver marcado, e apague a
-pasta `%LOCALAPPDATA%\PainelLeve`. Não há nada no registro além da entrada de inicialização.
+Clique direito no ícone → desmarque **Iniciar com o Windows** → **Sair**, e apague a pasta
+`%LOCALAPPDATA%\Programs\PainelLeve`. Não há nada no registro.
 
 ## Como usar
 
@@ -86,3 +87,6 @@ tap_dll=PainelLeveTap.dev2.dll
 - `IVisualTreeService2::GetPropertyIndex` devolve `E_INVALIDARG`; o índice vem de `GetPropertyValuesChain`.
 - `IAudioMeterInformation` não vem nos cabeçalhos do mingw; está declarada em `mixer.c`.
 - `SetMasterVolume` custa até ~20 ms por sessão; o mixer envia numa thread auxiliar para a interface não travar.
+- O Explorer carrega a DLL de `%LOCALAPPDATA%\Programs\PainelLeve`, `Documents` ou `%USERPROFILE%`, mas **não** de
+  `%LOCALAPPDATA%\PainelLeve` nem de `%APPDATA%\PainelLeve` (a injeção devolve S_OK e nada acontece).
+- Tarefa agendada de logon exige administrador; por isso "Iniciar com o Windows" usa a pasta Inicializar.
