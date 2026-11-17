@@ -1,7 +1,7 @@
 # PainelLeve
 
 Painel de controle leve na bandeja do Windows 11, em C puro + Win32, sem dependências.
-Substitui o TranslucentTB e o EarTrumpet num único app de ~80 KB e ~12 MB de RAM.
+Substitui o TranslucentTB e o EarTrumpet num único app de ~120 KB e ~13 MB de RAM, e ainda mostra a bateria do mouse sem fio na barra de tarefas.
 
 ## Instalar (um comando)
 
@@ -33,7 +33,8 @@ Clique direito no ícone → desmarque **Iniciar com o Windows** → **Sair**, e
 | Ação | Resultado |
 |---|---|
 | Clique **esquerdo** no ícone | abre/fecha o mixer de volume |
-| Clique **direito** no ícone | menu: barra transparente, medidor de velocidade, iniciar com o Windows, sair |
+| Clique **direito** no ícone | menu: barra transparente, medidor de velocidade, bateria do mouse, iniciar com o Windows, sair |
+| Bateria do mouse na barra | passe o cursor para ver o nome; clique para ler de novo; clique direito abre o menu |
 | No mixer: arrastar / roda do mouse | muda o volume (toca o som de amostra ao soltar) |
 | No mixer: clicar no ícone do app | silencia / desfaz |
 | No mixer: seta no cabeçalho | mostra ou esconde os outros dispositivos de saída |
@@ -45,6 +46,10 @@ Clique direito no ícone → desmarque **Iniciar com o Windows** → **Sair**, e
   carregada no Explorer via `InitializeXamlDiagnosticsEx`, que oculta o fundo XAML que o Windows 11 pinta
   por cima (mesma técnica do TranslucentTB).
 - **Medidor de velocidade da internet** — download/upload da interface que leva à internet.
+- **Bateria do mouse na barra de tarefas** — mouses Logitech em receptor Lightspeed / Unifying / Bolt, via protocolo
+  HID++ (o mesmo do G HUB; o percentual bate com o dele). Lido a cada 15 s numa thread própria; fica vermelho
+  abaixo de 15%, mostra um raio verde carregando e fica esmaecido com o mouse em repouso. Baseado em
+  [windows-taskbar-battery](https://github.com/renanleonel/windows-taskbar-battery) (MIT).
 - **Mixer de volume** estilo EarTrumpet — por dispositivo e por aplicativo, medidor de nível em tempo real,
   ícone por tipo de dispositivo, nomes amigáveis, animação de abertura.
 - Instância única; reaplica tudo se o Explorer reiniciar.
@@ -77,6 +82,8 @@ tap_dll=PainelLeveTap.dev2.dll
 |---|---|
 | `main.c` | bandeja, menu, transparência, medidor de velocidade, injeção da DLL |
 | `mixer.c` / `mixer.h` | mixer de volume (Core Audio) |
+| `battery.c` / `battery.h` | bateria do mouse Logitech (HID++) |
+| `PainelLeve.rc` / `PainelLeve.manifest` | manifesto (compatibilidade Windows 8+, exigida pela janela na barra) |
 | `tap.cpp` / `tap.def` | DLL carregada no Explorer (XAML diagnostics) |
 | `build.cmd` | compilação com `zig cc` / `zig c++` |
 | `instalar.ps1` | instalador/atualizador de um comando |
@@ -89,4 +96,6 @@ tap_dll=PainelLeveTap.dev2.dll
 - `SetMasterVolume` custa até ~20 ms por sessão; o mixer envia numa thread auxiliar para a interface não travar.
 - O Explorer carrega a DLL de `%LOCALAPPDATA%\Programs\PainelLeve`, `Documents` ou `%USERPROFILE%`, mas **não** de
   `%LOCALAPPDATA%\PainelLeve` nem de `%APPDATA%\PainelLeve` (a injeção devolve S_OK e nada acontece).
+- O indicador de bateria é uma janela filha *layered* da `Shell_TrayWnd`; isso só funciona com o manifesto de
+  compatibilidade Windows 8+ embutido no exe.
 - Tarefa agendada de logon exige administrador; por isso "Iniciar com o Windows" usa a pasta Inicializar.

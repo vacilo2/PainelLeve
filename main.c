@@ -1,5 +1,5 @@
 // PainelLeve - painel de controle leve na bandeja do Windows.
-// Recursos: barra de tarefas transparente e medidor de velocidade da internet.
+// Recursos: barra de tarefas transparente, medidor de velocidade, mixer de volume e bateria do mouse.
 // C puro + Win32, sem dependencias. Compilar: build.cmd (usa zig cc).
 
 #define UNICODE
@@ -8,6 +8,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <shlobj.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -21,14 +22,16 @@
 #include <stdlib.h>
 #include <objbase.h>
 #include "mixer.h"
+#include "battery.h"
 
 #define APP_NAME      L"PainelLeve"
 #define APP_TITLE     L"Painel Leve"
 #define WM_TRAY       (WM_APP + 1)
+#define WM_BATTERY    (WM_APP + 2)
 #define TIMER_TICK    1
 #define TICK_MS       1000
 
-enum { ID_TRANSP = 100, ID_METER, ID_STARTUP, ID_EXIT, ID_MIXER };
+enum { ID_TRANSP = 100, ID_METER, ID_STARTUP, ID_EXIT, ID_MIXER, ID_BATTERY };
 
 // ---- SetWindowCompositionAttribute (nao documentada) ----
 typedef struct { int AccentState; int AccentFlags; DWORD GradientColor; int AnimationId; } ACCENT_POLICY;
@@ -274,6 +277,145 @@ static void ShowMeter(BOOL on) {
     } else if (!on && g_meter) { DestroyWindow(g_meter); g_meter = NULL; }
 }
 
+// ---------------------------------------------------------------- bateria do mouse na barra de tarefas
+// Janela filha "layered" da Shell_TrayWnd, logo a esquerda da area de notificacao, desenhada com alfa
+// por pixel (UpdateLayeredWindow) para o texto se misturar com a barra transparente. Morre junto com o
+// Explorer e e recriada. Exige o manifesto de compatibilidade Windows 8+ (PainelLeve.rc).
+static HWND g_batt;
+static void BatteryTip(const WCHAR *text);
+static BOOL g_battOn;
+static int g_battW;
+
+static BOOL LightTaskbar(void) {
+    DWORD v = 0, sz = sizeof v;
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                 L"SystemUsesLightTheme", RRF_RT_REG_DWORD, NULL, &v, &sz);
+    return v != 0;
+}
+
+static void PlaceBattery(void) {
+    if (!g_batt || !IsWindow(g_batt)) return;
+    HWND tray = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (!tray || !g_battW) { ShowWindow(g_batt, SW_HIDE); return; }
+    RECT tr, nr; GetWindowRect(tray, &tr);
+    int right = tr.right;
+    HWND notify = FindWindowExW(tray, NULL, L"TrayNotifyWnd", NULL);
+    if (notify && GetWindowRect(notify, &nr) && nr.right > nr.left) right = nr.left;
+    int x = right - tr.left - g_battW - S(4), h = tr.bottom - tr.top;
+    RECT cur; GetWindowRect(g_batt, &cur);
+    BOOL moved = cur.left - tr.left != x || cur.top != tr.top || cur.right - cur.left != g_battW || cur.bottom - cur.top != h;
+    if (moved || GetWindow(tray, GW_CHILD) != g_batt || !IsWindowVisible(g_batt))   // acima do conteudo XAML da barra
+        SetWindowPos(g_batt, HWND_TOP, x, 0, g_battW, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void DrawBattery(void) {
+    if (!g_batt || !IsWindow(g_batt)) return;
+    HWND tray = FindWindowW(L"Shell_TrayWnd", NULL); if (!tray) return;
+    BatteryInfo b;
+    if (!Battery_Get(&b)) { g_battW = 0; PlaceBattery(); return; }
+    RECT tr; GetWindowRect(tray, &tr);
+    int h = tr.bottom - tr.top;
+    BOOL light = LightTaskbar();
+    COLORREF fg = light ? RGB(0, 0, 0) : RGB(255, 255, 255);
+    COLORREF red = light ? RGB(0xC4, 0x2B, 0x1C) : RGB(0xFF, 0x6B, 0x6B);
+    COLORREF green = light ? RGB(0x0F, 0x7B, 0x0F) : RGB(0x6C, 0xCB, 0x5F);
+    COLORREF txtColor = (b.percent <= 15 && !b.charging) ? red : fg;
+    BYTE opacity = b.stale ? 130 : 255;                 // mouse dormindo: ultimo valor, esmaecido
+
+    struct { WCHAR t[8]; BOOL icon; COLORREF c; int x, w, gap; } seg[3];
+    int ns = 0;
+    wcscpy(seg[ns].t, L"\xE962"); seg[ns].icon = TRUE; seg[ns].c = txtColor; seg[ns].gap = S(5); ns++;   // mouse
+    _snwprintf(seg[ns].t, 8, L"%d%%", b.percent); seg[ns].icon = FALSE; seg[ns].c = txtColor; seg[ns].gap = S(2); ns++;
+    if (b.charging) { wcscpy(seg[ns].t, L"\xE945"); seg[ns].icon = TRUE; seg[ns].c = green; seg[ns].gap = 0; ns++; } // raio
+
+    HDC dc = CreateCompatibleDC(NULL);
+    HFONT ft = CreateFontW(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HFONT fi = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe Fluent Icons");
+    int pad = S(6), x = pad;
+    for (int i = 0; i < ns; i++) {
+        SelectObject(dc, seg[i].icon ? fi : ft);
+        SIZE sz; GetTextExtentPoint32W(dc, seg[i].t, (int)wcslen(seg[i].t), &sz);
+        seg[i].x = x; seg[i].w = sz.cx; x += sz.cx + (i < ns - 1 ? seg[i].gap : 0);
+    }
+    int w = x + pad;
+
+    BITMAPINFO bi = {0};
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    DWORD *px; HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    HGDIOBJ ob = SelectObject(dc, bmp);
+    ZeroMemory(px, (size_t)w * h * 4);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(255, 255, 255));
+    for (int i = 0; i < ns; i++) {                      // branco sobre preto: o brilho vira cobertura (alfa)
+        SelectObject(dc, seg[i].icon ? fi : ft);
+        RECT r = { seg[i].x, 0, seg[i].x + seg[i].w, h };
+        DrawTextW(dc, seg[i].t, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOCLIP | DT_NOPREFIX);
+    }
+    GdiFlush();
+    for (int y = 0; y < h; y++) for (int xx = 0; xx < w; xx++) {
+        DWORD p = px[y * w + xx];
+        int cov = max(max((int)(p & 0xFF), (int)(p >> 8 & 0xFF)), (int)(p >> 16 & 0xFF));
+        COLORREF c = fg;
+        for (int i = 0; i < ns; i++) if (xx >= seg[i].x - 1 && xx < seg[i].x + seg[i].w + 1) c = seg[i].c;
+        int a = cov * opacity / 255;
+        // pixel 100% transparente nao recebe clique; alfa minimo 1 deixa a janela "clicavel" por inteiro
+        px[y * w + xx] = a ? ((DWORD)a << 24) | ((GetRValue(c) * a / 255) << 16) | ((GetGValue(c) * a / 255) << 8) | (GetBValue(c) * a / 255)
+                           : 0x01000000;
+    }
+    POINT src = { 0, 0 }; SIZE size = { w, h };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_batt, NULL, NULL, &size, dc, &src, 0, &bf, ULW_ALPHA);
+    SelectObject(dc, ob); DeleteObject(bmp); DeleteObject(ft); DeleteObject(fi); DeleteDC(dc);
+
+    WCHAR tip[128];
+    _snwprintf(tip, 128, L"%s: %d%%%s%s", b.name, b.percent, b.charging ? L" (carregando)" : L"", b.stale ? L" (em repouso)" : L"");
+    BatteryTip(tip);
+    g_battW = w;
+    PlaceBattery();
+}
+
+static LRESULT CALLBACK BattProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_LBUTTONUP: Battery_Refresh(); return 0;                                   // clique: le agora
+    case WM_RBUTTONUP: PostMessageW(g_main, WM_TRAY, 0, WM_CONTEXTMENU); return 0;
+    case WM_NCDESTROY: RemovePropW(h, L"tip"); if (h == g_batt) g_batt = NULL; break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// dica (tooltip) com o nome do mouse ao passar o cursor
+static HWND g_battTip;
+static void BatteryTip(const WCHAR *text) {
+    if (!g_batt) return;
+    TTTOOLINFOW ti = {0}; ti.cbSize = sizeof ti; ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = g_main; ti.uId = (UINT_PTR)g_batt; ti.lpszText = (WCHAR *)text;
+    if (!g_battTip || !IsWindow(g_battTip)) {
+        g_battTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                    CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, g_main, NULL, g_hinst, NULL);
+        if (!g_battTip) return;
+    }
+    if (GetPropW(g_batt, L"tip")) SendMessageW(g_battTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    else { SendMessageW(g_battTip, TTM_ADDTOOLW, 0, (LPARAM)&ti); SetPropW(g_batt, L"tip", (HANDLE)1); }
+}
+
+static void EnsureBattery(void) {
+    if (!g_battOn) { if (g_batt) { DestroyWindow(g_batt); g_batt = NULL; } return; }
+    if (g_batt && IsWindow(g_batt)) { PlaceBattery(); return; }
+    HWND tray = FindWindowW(L"Shell_TrayWnd", NULL); if (!tray) return;
+    g_batt = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"PainelLeveBattery", L"", WS_CHILD | WS_CLIPSIBLINGS,
+                             0, 0, 1, 1, tray, NULL, g_hinst, NULL);
+    if (!g_batt) { StartLog(L"falha ao criar o indicador de bateria"); return; }
+    if (g_battTip) { DestroyWindow(g_battTip); g_battTip = NULL; }   // a ferramenta antiga apontava para a janela morta
+    g_battW = 0;
+    DrawBattery();
+}
+
+static void ShowBattery(BOOL on) {
+    if (on) { Battery_Start(g_main, WM_BATTERY); EnsureBattery(); Battery_Refresh(); }
+    else { if (g_batt) DestroyWindow(g_batt); g_batt = NULL; }
+}
+
 // ---------------------------------------------------------------- bandeja e janela principal (oculta)
 static void TrayAdd(void) {
     NOTIFYICONDATAW n = { sizeof n }; n.hWnd = g_main; n.uID = 1;
@@ -284,7 +426,7 @@ static void TrayAdd(void) {
 static void TrayRemove(void) { NOTIFYICONDATAW n = { sizeof n }; n.hWnd = g_main; n.uID = 1; Shell_NotifyIconW(NIM_DELETE, &n); }
 
 static void UpdateTimer(void) {
-    if (g_transp || g_meterOn) SetTimer(g_main, TIMER_TICK, TICK_MS, NULL); else KillTimer(g_main, TIMER_TICK);
+    if (g_transp || g_meterOn || g_battOn) SetTimer(g_main, TIMER_TICK, TICK_MS, NULL); else KillTimer(g_main, TIMER_TICK);
 }
 
 static void ShowMenu(void) {
@@ -293,6 +435,7 @@ static void ShowMenu(void) {
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (g_transp ? MF_CHECKED : 0), ID_TRANSP, L"Barra de tarefas transparente");
     AppendMenuW(m, MF_STRING | (g_meterOn ? MF_CHECKED : 0), ID_METER, L"Medidor de velocidade");
+    AppendMenuW(m, MF_STRING | (g_battOn ? MF_CHECKED : 0), ID_BATTERY, L"Bateria do mouse na barra");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), ID_STARTUP, L"Iniciar com o Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -306,7 +449,7 @@ static void ShowMenu(void) {
 
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == g_taskbarCreated) {                        // Explorer reiniciou: recoloca o icone e reaplica
-        TrayAdd(); if (g_transp) ApplyTaskbars(ACCENT_TRANSPARENT); return 0;
+        TrayAdd(); if (g_transp) ApplyTaskbars(ACCENT_TRANSPARENT); g_batt = NULL; EnsureBattery(); return 0;
     }
     switch (m) {
     case WM_TRAY:
@@ -319,6 +462,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                          ApplyTaskbars(g_transp ? ACCENT_TRANSPARENT : ACCENT_DISABLED); UpdateTimer(); break;
         case ID_METER:   g_meterOn = !g_meterOn; IniWriteInt(L"medidor", g_meterOn); ShowMeter(g_meterOn); UpdateTimer(); break;
         case ID_STARTUP: SetStartup(!StartupEnabled()); break;
+        case ID_BATTERY: g_battOn = !g_battOn; IniWriteInt(L"bateria", g_battOn); ShowBattery(g_battOn); UpdateTimer(); break;
         case ID_MIXER:   Mixer_Toggle(); break;
         case ID_EXIT:    DestroyWindow(h); break;
         }
@@ -326,12 +470,15 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_TIMER:
         if (g_transp) ApplyTaskbars(ACCENT_TRANSPARENT);   // o Explorer as vezes volta ao normal; reaplicar e barato
         if (g_meter) { UpdateSpeed(); InvalidateRect(g_meter, NULL, FALSE); }
+        if (g_battOn) EnsureBattery();                  // recria se o Explorer reiniciou; mantem a posicao
         return 0;
+    case WM_BATTERY: DrawBattery(); return 0;
     case WM_DISPLAYCHANGE: case WM_SETTINGCHANGE:
         if (g_transp) ApplyTaskbars(ACCENT_TRANSPARENT);
+        if (g_batt) DrawBattery();                      // tema claro/escuro, DPI, tamanho da barra
         return 0;
     case WM_DESTROY:
-        KillTimer(h, TIMER_TICK); Mixer_Close(); ShowMeter(FALSE); TrayRemove();
+        KillTimer(h, TIMER_TICK); Mixer_Close(); ShowMeter(FALSE); ShowBattery(FALSE); Battery_Stop(); TrayRemove();
         if (g_transp) ApplyTaskbars(ACCENT_DISABLED);
         PostQuitMessage(0); return 0;
     }
@@ -373,6 +520,9 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show) {
     WNDCLASSW wc = {0}; wc.lpfnWndProc = MainProc; wc.hInstance = hi; wc.lpszClassName = L"PainelLeveMain"; RegisterClassW(&wc);
     WNDCLASSW mc = {0}; mc.lpfnWndProc = MeterProc; mc.hInstance = hi; mc.lpszClassName = L"PainelLeveMeter";
     mc.hCursor = LoadCursorW(NULL, IDC_ARROW); RegisterClassW(&mc);
+    WNDCLASSW bc = {0}; bc.lpfnWndProc = BattProc; bc.hInstance = hi; bc.lpszClassName = L"PainelLeveBattery";
+    bc.hCursor = LoadCursorW(NULL, IDC_ARROW); RegisterClassW(&bc);
+    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_WIN95_CLASSES }; InitCommonControlsEx(&icc);
 
     // janela top-level oculta (nao message-only): recebe o broadcast "TaskbarCreated" e serve de dona do menu
     g_main = CreateWindowExW(WS_EX_TOOLWINDOW, L"PainelLeveMain", APP_TITLE, WS_POPUP, 0, 0, 0, 0, NULL, NULL, hi, NULL);
@@ -381,7 +531,9 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show) {
     g_transp  = IniReadInt(L"transparente", 1);
     g_meterOn = IniReadInt(L"medidor", 1);
     if (g_transp) ApplyTaskbars(ACCENT_TRANSPARENT);
+    g_battOn  = IniReadInt(L"bateria", 1);
     ShowMeter(g_meterOn);
+    if (g_battOn) ShowBattery(TRUE);
     UpdateTimer();
 
     StartLog(L"pronto (icone na bandeja)");
