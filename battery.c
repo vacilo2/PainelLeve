@@ -220,8 +220,24 @@ static int VoltPercent(const USHORT *pids, int np, int mv) {
 }
 
 // ---------- descoberta e leitura ----------
-typedef struct { WCHAR name[64]; int kind; USHORT pids[4]; int npids; BOOL known; } Ident;
-static Ident g_ident[7];          // por indice 1..6 do receptor (um receptor basta)
+// Identidade de cada dispositivo ja visto, por "interface + indice". O mouse aparece de dois jeitos:
+// pelo receptor (sem fio, indices 1..6) e, quando ligado no cabo para carregar, como dispositivo USB
+// proprio (outro PID, indice 0xFF).
+typedef struct { WCHAR key[80]; WCHAR name[64]; int kind; USHORT pids[4]; int npids; BOOL known; int misses; int lastPct; } Ident;
+static Ident g_ident[24];
+
+static Ident *IdentFor(const WCHAR *ep, BYTE idx) {
+    WCHAR key[80]; _snwprintf(key, 80, L"%s:%02x", ep, idx); key[79] = 0;
+    Ident *freeSlot = NULL;
+    for (int i = 0; i < 24; i++) {
+        if (!wcscmp(g_ident[i].key, key)) return &g_ident[i];
+        if (!g_ident[i].key[0] && !freeSlot) freeSlot = &g_ident[i];
+    }
+    if (!freeSlot) { freeSlot = &g_ident[0]; }          // cheio (improvavel): reaproveita
+    ZeroMemory(freeSlot, sizeof *freeSlot); wcscpy(freeSlot->key, key); freeSlot->kind = -1;
+    return freeSlot;
+}
+static BOOL IsMouse(const Ident *id) { return id->kind >= 3 && id->kind <= 5; }
 
 static void Identify(Link *l, BYTE idx, Ident *id) {
     BYTE fi, r[16], err;
@@ -255,7 +271,7 @@ static int ReadBattery(Link *l, BYTE idx, const Ident *id, int *pct, BOOL *chg, 
     if ((rc = FeatureIndex(l, idx, F_BATT_UNIFIED, &fi, err)) != R_OK) return rc;
     if (fi) {
         if ((rc = Request(l, idx, fi, 1, NULL, 0, r, err)) != R_OK) return rc;
-        *pct = r[0]; *chg = (r[2] == 1 || r[2] == 2); return R_OK;
+        *pct = r[0]; *chg = (r[2] == 1 || r[2] == 2 || r[2] == 3); return R_OK;   // 3 = carga completa (ainda no cabo)
     }
     if ((rc = FeatureIndex(l, idx, F_BATT_STATUS, &fi, err)) != R_OK) return rc;
     if (fi) {
@@ -273,13 +289,28 @@ static int ReadBattery(Link *l, BYTE idx, const Ident *id, int *pct, BOOL *chg, 
     return R_PROTO; // sem feature de bateria
 }
 
-// encontra as colecoes HID++ (curta/longa) do primeiro receptor Logitech presente
-static BOOL FindReceiver(WCHAR *shortPath, WCHAR *longPath) {
+// Uma interface HID++ da Logitech: receptor ou dispositivo ligado direto (mouse no cabo, dongle etc.)
+typedef struct { WCHAR key[64]; WCHAR shortPath[512], longPath[512]; BOOL receiver; } Endpoint;
+
+// chave da interface: "vid_046d&pid_c09b&mi_02" (o caminho sem a parte "&colNN" e sem a instancia)
+static void EndpointKey(const WCHAR *path, WCHAR *key) {
+    key[0] = 0;
+    const WCHAR *s = wcsstr(path, L"#"); if (!s) s = path; else s++;
+    int n = 0;
+    while (*s && *s != L'#' && n < 63) {
+        if (s[0] == L'&' && (s[1] | 32) == L'c' && (s[2] | 32) == L'o' && (s[3] | 32) == L'l') { s += 4; while (*s && *s != L'&' && *s != L'#') s++; continue; }
+        key[n++] = towlower(*s++);
+    }
+    key[n] = 0;
+}
+
+// lista as interfaces HID++ (colecoes de pagina >= 0xFF00 com relatorio longo) de todos os aparelhos Logitech
+static int FindEndpoints(Endpoint *eps, int max) {
     GUID hid; HidD_GetHidGuid(&hid);
     HDEVINFO set = SetupDiGetClassDevsW(&hid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (set == INVALID_HANDLE_VALUE) return FALSE;
-    shortPath[0] = longPath[0] = 0;
-    SP_DEVICE_INTERFACE_DATA ifd = { sizeof ifd };
+    if (set == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    SP_DEVICE_INTERFACE_DATA ifd = { sizeof ifd, {0}, 0, 0 };
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(set, NULL, &hid, i, &ifd); i++) {
         BYTE detBuf[1024]; PSP_DEVICE_INTERFACE_DETAIL_DATA_W det = (void *)detBuf;
         det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
@@ -287,24 +318,32 @@ static BOOL FindReceiver(WCHAR *shortPath, WCHAR *longPath) {
         // abre so para consultar atributos (sem acesso de leitura/escrita: funciona ate em dispositivos exclusivos)
         HANDLE h = CreateFileW(det->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (h == INVALID_HANDLE_VALUE) continue;
-        HIDD_ATTRIBUTES at = { sizeof at };
-        BOOL rcv = FALSE;
-        if (HidD_GetAttributes(h, &at) && at.VendorID == LOGI_VID)
-            for (size_t k = 0; k < sizeof RECEIVER_PIDS / sizeof *RECEIVER_PIDS; k++) if (RECEIVER_PIDS[k] == at.ProductID) rcv = TRUE;
-        if (rcv) {
-            PHIDP_PREPARSED_DATA pp; HIDP_CAPS caps;
-            if (HidD_GetPreparsedData(h, &pp)) {
-                if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS && caps.UsagePage >= 0xFF00) {
-                    if ((caps.Usage & 0xFF) == 0x01 && !shortPath[0]) wcscpy(shortPath, det->DevicePath);
-                    if ((caps.Usage & 0xFF) == 0x02 && !longPath[0]) wcscpy(longPath, det->DevicePath);
+        HIDD_ATTRIBUTES at = { sizeof at, 0, 0, 0 };
+        PHIDP_PREPARSED_DATA pp; HIDP_CAPS caps;
+        if (HidD_GetAttributes(h, &at) && at.VendorID == LOGI_VID && HidD_GetPreparsedData(h, &pp)) {
+            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS && caps.UsagePage >= 0xFF00 &&
+                ((caps.Usage & 0xFF) == 0x01 || (caps.Usage & 0xFF) == 0x02)) {
+                WCHAR key[64]; EndpointKey(det->DevicePath, key);
+                int k = 0; while (k < n && wcscmp(eps[k].key, key)) k++;
+                if (k == n && n < max) {
+                    ZeroMemory(&eps[n], sizeof eps[n]); wcscpy(eps[n].key, key);
+                    for (size_t j = 0; j < sizeof RECEIVER_PIDS / sizeof *RECEIVER_PIDS; j++)
+                        if (RECEIVER_PIDS[j] == at.ProductID) eps[n].receiver = TRUE;
+                    n++;
                 }
-                HidD_FreePreparsedData(pp);
+                if (k < n) {
+                    if ((caps.Usage & 0xFF) == 0x01 && !eps[k].shortPath[0]) wcscpy(eps[k].shortPath, det->DevicePath);
+                    if ((caps.Usage & 0xFF) == 0x02 && !eps[k].longPath[0]) wcscpy(eps[k].longPath, det->DevicePath);
+                }
             }
+            HidD_FreePreparsedData(pp);
         }
         CloseHandle(h);
     }
     SetupDiDestroyDeviceInfoList(set);
-    return longPath[0] != 0;
+    int m = 0;                                          // so interessam as que aceitam relatorio longo
+    for (int i = 0; i < n; i++) if (eps[i].longPath[0]) eps[m++] = eps[i];
+    return m;
 }
 
 // ---------- estado compartilhado + thread ----------
@@ -322,44 +361,64 @@ static void Publish(const BatteryInfo *b) {
     if (changed && g_notify) PostMessageW(g_notify, g_msg, 0, 0);
 }
 
-// uma varredura; devolve TRUE se leu algum mouse
+// Uma varredura em todas as interfaces HID++ (receptor e mouse no cabo). Uma leitura ao vivo vence uma
+// "em repouso": no cabo o mouse responde direto, mesmo que o receptor ainda o tenha pareado.
+static unsigned g_scanNo;
 static BOOL Scan(BatteryInfo *out) {
     if (!g_curvesLoaded) { CollectCurves(L"C:\\ProgramData\\LGHUB\\depots", 0); g_curvesLoaded = TRUE; }
-    WCHAR sp[512], lp[512];
-    if (!FindReceiver(sp, lp)) { ZeroMemory(g_ident, sizeof g_ident); return FALSE; }
-    Link l = {0};
-    if (!ChanOpen(&l.lng, lp)) return FALSE;
-    l.hasShort = sp[0] && ChanOpen(&l.sht, sp);
-    BOOL found = FALSE;
-    for (BYTE idx = 1; idx <= 6 && !found; idx++) {
-        Ident *id = &g_ident[idx];
-        int pct = 0; BOOL chg = FALSE; BYTE err = 0;
-        Ident tmp = {0};
-        int rc = ReadBattery(&l, idx, id->known ? id : &tmp, &pct, &chg, &err);
-        // dispositivo dormindo: a primeira requisicao o acorda; so insiste se ainda nao o conhecemos
-        for (int tries = 0; rc == R_TIMEOUT && !id->known && tries < 2; tries++) {
-            if (WaitForSingleObject(g_stop, 500) == WAIT_OBJECT_0) break;
-            rc = ReadBattery(&l, idx, &tmp, &pct, &chg, &err);
+    static Endpoint eps[8];
+    int ne = FindEndpoints(eps, 8);
+    g_scanNo++;
+    BOOL live = FALSE, stale = FALSE;
+    BatteryInfo best = *out;
+    for (int e = 0; e < ne && !live; e++) {
+        Endpoint *ep = &eps[e];
+        // aparelho direto que nunca respondeu HID++ (ex.: fone com fio): tenta de novo so a cada ~5 min
+        if (!ep->receiver) {
+            Ident *d = IdentFor(ep->key, 0xFF);
+            if (d->known && !IsMouse(d)) continue;      // ja sabemos que nao e mouse
+            if (!d->known && d->misses >= 2 && g_scanNo % 20) continue;
         }
-        if (rc == R_PROTO && err == ERR_UNKNOWN_DEVICE) { id->known = FALSE; continue; }   // slot vazio
-        if (rc == R_OK) {
-            if (!id->known) {
-                Identify(&l, idx, id);
-                ReadBattery(&l, idx, id, &pct, &chg, &err);   // rele com os pids do modelo (curva do G HUB)
+        Link l = {0};
+        if (!ChanOpen(&l.lng, ep->longPath)) continue;
+        l.hasShort = ep->shortPath[0] && ChanOpen(&l.sht, ep->shortPath);
+        for (int i = ep->receiver ? 1 : 0; i <= (ep->receiver ? 6 : 0) && !live; i++) {
+            BYTE idx = ep->receiver ? (BYTE)i : 0xFF;
+            Ident *id = IdentFor(ep->key, idx);
+            if (id->known && !IsMouse(id) && id->kind != -1) continue;   // teclado etc.
+            int pct = 0; BOOL chg = FALSE; BYTE err = 0;
+            int rc = ReadBattery(&l, idx, id, &pct, &chg, &err);
+            // mouse dormindo: a primeira requisicao o acorda; so insiste se ainda nao o conhecemos
+            for (int t = 0; ep->receiver && rc == R_TIMEOUT && !id->known && t < 2; t++) {
+                if (WaitForSingleObject(g_stop, 500) == WAIT_OBJECT_0) break;
+                rc = ReadBattery(&l, idx, id, &pct, &chg, &err);
             }
-            // so mouses (tipos 3..5); teclados etc. ficam de fora
-            if (id->kind != -1 && (id->kind < 3 || id->kind > 5)) continue;
-            out->present = TRUE; out->stale = FALSE; out->percent = pct; out->charging = chg;
-            wcscpy(out->name, id->name);
-            found = TRUE;
-        } else if (rc == R_TIMEOUT && id->known && (id->kind == -1 || (id->kind >= 3 && id->kind <= 5))) {
-            out->present = TRUE; out->stale = TRUE;           // mantem o ultimo valor, esmaecido
-            wcscpy(out->name, id->name);
-            found = TRUE;
+            if (rc == R_PROTO && err == ERR_UNKNOWN_DEVICE) { id->known = FALSE; continue; }   // slot vazio
+            if (rc == R_OK) {
+                id->misses = 0;
+                if (!id->known) {
+                    Identify(&l, idx, id);
+                    ReadBattery(&l, idx, id, &pct, &chg, &err);     // rele com os pids do modelo (curva do G HUB)
+                }
+                // so mouses; no receptor, aparelho sem tipo informado tambem vale
+                if (!IsMouse(id) && !(ep->receiver && id->kind == -1)) continue;
+                id->lastPct = pct;
+                best.present = TRUE; best.stale = FALSE; best.percent = pct; best.charging = chg;
+                wcscpy(best.name, id->name);
+                live = TRUE;
+            } else {
+                if (!id->known) id->misses++;
+                if (rc == R_TIMEOUT && id->known && !stale && (IsMouse(id) || id->kind == -1)) {
+                    stale = TRUE;                       // mantem o ultimo valor, esmaecido
+                    best.present = TRUE; best.stale = TRUE; best.charging = FALSE; best.percent = id->lastPct;
+                    wcscpy(best.name, id->name);
+                }
+            }
         }
+        ChanClose(&l.sht); ChanClose(&l.lng);
     }
-    ChanClose(&l.sht); ChanClose(&l.lng);
-    return found;
+    if (live || stale) *out = best;
+    return live || stale;
 }
 
 static DWORD WINAPI Worker(LPVOID p) {
@@ -406,22 +465,16 @@ int main(void) {
     InitializeCriticalSection(&g_cs);
     g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
     CollectCurves(L"C:\\ProgramData\\LGHUB\\depots", 0); g_curvesLoaded = TRUE;
-    printf("curvas G HUB: %d\n", g_ncurves);
-    for (int i = 0; i < g_ncurves; i++) printf("  pid %04X, %d pontos\n", g_curves[i].pid, g_curves[i].n);
-    WCHAR sp[512], lp[512];
-    if (!FindReceiver(sp, lp)) { printf("receptor nao encontrado\n"); return 1; }
-    printf("curta: %ls\nlonga: %ls\n", sp, lp);
-    for (int k = 0; k < 2; k++) {
+    Endpoint eps[8]; int ne = FindEndpoints(eps, 8);
+    for (int i = 0; i < ne; i++) printf("interface %ls receptor=%d\n", eps[i].key, eps[i].receiver);
+    for (int k = 0; k < 3; k++) {
         BatteryInfo b = {0};
         DWORD t = GetTickCount();
         BOOL ok = Scan(&b);
-        printf("scan %d: ok=%d %ls %d%% carregando=%d stale=%d (%lu ms)\n", k, ok, b.name, b.percent, b.charging, b.stale, GetTickCount() - t);
-        for (int i = 1; i <= 6; i++) if (g_ident[i].known) {
-            printf("  slot %d: %ls tipo=%d pids:", i, g_ident[i].name, g_ident[i].kind);
-            for (int j = 0; j < g_ident[i].npids; j++) printf(" %04X", g_ident[i].pids[j]);
-            printf("\n");
-        }
+        printf("scan %d: ok=%d %ls %d%% carregando=%d repouso=%d (%lu ms)\n", k, ok, b.name, b.percent, b.charging, b.stale, GetTickCount() - t);
     }
+    for (int i = 0; i < 24; i++) if (g_ident[i].key[0])
+        printf("  %ls: %ls tipo=%d conhecido=%d falhas=%d\n", g_ident[i].key, g_ident[i].name, g_ident[i].kind, g_ident[i].known, g_ident[i].misses);
     return 0;
 }
 #endif
