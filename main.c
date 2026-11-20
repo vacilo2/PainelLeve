@@ -30,6 +30,8 @@
 #define WM_BATTERY    (WM_APP + 2)
 #define TIMER_TICK    1
 #define TICK_MS       1000
+#define TIMER_HOVER   2
+#define HOVER_MS      150
 
 enum { ID_TRANSP = 100, ID_METER, ID_STARTUP, ID_EXIT, ID_MIXER, ID_BATTERY };
 
@@ -283,6 +285,7 @@ static void ShowMeter(BOOL on) {
 // Explorer e e recriada. Exige o manifesto de compatibilidade Windows 8+ (PainelLeve.rc).
 static HWND g_batt;
 static void BatteryTip(const WCHAR *text);
+static void TipShow(BOOL on);
 static BOOL g_battOn;
 static int g_battW;
 
@@ -368,7 +371,8 @@ static void DrawBattery(void) {
     SelectObject(dc, ob); DeleteObject(bmp); DeleteObject(ft); DeleteObject(fi); DeleteDC(dc);
 
     WCHAR tip[128];
-    _snwprintf(tip, 128, L"%s: %d%%%s%s", b.name, b.percent, b.charging ? L" (carregando)" : L"", b.stale ? L" (em repouso)" : L"");
+    _snwprintf(tip, 128, L"%s%s\nBateria: %d%%%s%s", wcsncmp(b.name, L"Logitech", 8) ? L"Logitech " : L"", b.name, b.percent,
+               b.charging ? L" (carregando)" : L"", b.stale ? L" (em repouso)" : L"");
     BatteryTip(tip);
     g_battW = w;
     PlaceBattery();
@@ -379,24 +383,58 @@ static LRESULT CALLBACK BattProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_LBUTTONUP: Battery_Refresh(); return 0;                                   // clique: le agora
     case WM_RBUTTONUP: PostMessageW(g_main, WM_TRAY, 0, WM_CONTEXTMENU); return 0;
-    case WM_NCDESTROY: RemovePropW(h, L"tip"); if (h == g_batt) g_batt = NULL; break;
+    case WM_NCDESTROY: TipShow(FALSE); if (h == g_batt) g_batt = NULL; break;
     }
     return DefWindowProcW(h, m, w, l);
 }
 
-// dica (tooltip) com o nome do mouse ao passar o cursor
+// dica (tooltip) com o modelo do mouse ao passar o cursor. Tooltip "tracking" mostrado a mao:
+// o modo automatico (TTF_SUBCLASS) nao aparecia sobre a barra de tarefas.
 static HWND g_battTip;
+static WCHAR g_tipText[160];
+static BOOL g_tipShown;
 static void BatteryTip(const WCHAR *text) {
-    if (!g_batt) return;
-    TTTOOLINFOW ti = {0}; ti.cbSize = sizeof ti; ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-    ti.hwnd = g_main; ti.uId = (UINT_PTR)g_batt; ti.lpszText = (WCHAR *)text;
+    wcsncpy(g_tipText, text, 159); g_tipText[159] = 0;
+    if (g_tipShown && g_battTip) {
+        TTTOOLINFOW ti = {0}; ti.cbSize = sizeof ti; ti.hwnd = g_main; ti.uId = 1; ti.lpszText = g_tipText;
+        SendMessageW(g_battTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    }
+}
+static void TipShow(BOOL on) {
+    TTTOOLINFOW ti = {0}; ti.cbSize = sizeof ti; ti.hwnd = g_main; ti.uId = 1;
+    if (!on) { if (g_battTip && g_tipShown) SendMessageW(g_battTip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti); g_tipShown = FALSE; return; }
     if (!g_battTip || !IsWindow(g_battTip)) {
         g_battTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                                     CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, g_main, NULL, g_hinst, NULL);
         if (!g_battTip) return;
+        ti.uFlags = TTF_TRACK | TTF_ABSOLUTE; ti.lpszText = g_tipText;
+        SendMessageW(g_battTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        SendMessageW(g_battTip, TTM_SETMAXTIPWIDTH, 0, S(400));
     }
-    if (GetPropW(g_batt, L"tip")) SendMessageW(g_battTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
-    else { SendMessageW(g_battTip, TTM_ADDTOOLW, 0, (LPARAM)&ti); SetPropW(g_batt, L"tip", (HANDLE)1); }
+    ti.lpszText = g_tipText;
+    SendMessageW(g_battTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    RECT r; GetWindowRect(g_batt, &r);
+    SendMessageW(g_battTip, TTM_TRACKPOSITION, 0, MAKELPARAM(r.left, r.top));
+    SendMessageW(g_battTip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+    RECT tr; GetWindowRect(g_battTip, &tr);              // tamanho real ja com as duas linhas
+    int tw = tr.right - tr.left, th = tr.bottom - tr.top;
+    int x = (r.left + r.right) / 2 - tw / 2, y = r.top - th - S(6);
+    HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = { sizeof mi }; GetMonitorInfoW(mon, &mi);
+    if (x + tw > mi.rcMonitor.right) x = mi.rcMonitor.right - tw - S(4);
+    if (x < mi.rcMonitor.left) x = mi.rcMonitor.left;
+    if (y < mi.rcMonitor.top) y = r.bottom + S(6);
+    SetWindowPos(g_battTip, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    g_tipShown = TRUE;
+}
+
+// A barra do Windows 11 (XAML) captura o mouse: a janela filha nao recebe WM_MOUSEMOVE/HOVER.
+// Por isso o cursor e consultado por timer enquanto o indicador esta ligado.
+static void PollHover(void) {
+    static int ticks;
+    POINT pt; RECT r;
+    BOOL in = g_batt && IsWindowVisible(g_batt) && GetCursorPos(&pt) && GetWindowRect(g_batt, &r) && PtInRect(&r, pt);
+    if (!in) { ticks = 0; if (g_tipShown) TipShow(FALSE); return; }
+    if (++ticks == 400 / HOVER_MS) TipShow(TRUE);
 }
 
 static void EnsureBattery(void) {
@@ -406,7 +444,6 @@ static void EnsureBattery(void) {
     g_batt = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"PainelLeveBattery", L"", WS_CHILD | WS_CLIPSIBLINGS,
                              0, 0, 1, 1, tray, NULL, g_hinst, NULL);
     if (!g_batt) { StartLog(L"falha ao criar o indicador de bateria"); return; }
-    if (g_battTip) { DestroyWindow(g_battTip); g_battTip = NULL; }   // a ferramenta antiga apontava para a janela morta
     g_battW = 0;
     DrawBattery();
 }
@@ -427,6 +464,7 @@ static void TrayRemove(void) { NOTIFYICONDATAW n = { sizeof n }; n.hWnd = g_main
 
 static void UpdateTimer(void) {
     if (g_transp || g_meterOn || g_battOn) SetTimer(g_main, TIMER_TICK, TICK_MS, NULL); else KillTimer(g_main, TIMER_TICK);
+    if (g_battOn) SetTimer(g_main, TIMER_HOVER, HOVER_MS, NULL); else { KillTimer(g_main, TIMER_HOVER); TipShow(FALSE); }
 }
 
 static void ShowMenu(void) {
@@ -468,6 +506,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_TIMER:
+        if (w == TIMER_HOVER) { PollHover(); return 0; }
         if (g_transp) ApplyTaskbars(ACCENT_TRANSPARENT);   // o Explorer as vezes volta ao normal; reaplicar e barato
         if (g_meter) { UpdateSpeed(); InvalidateRect(g_meter, NULL, FALSE); }
         if (g_battOn) EnsureBattery();                  // recria se o Explorer reiniciou; mantem a posicao
